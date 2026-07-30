@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_markdown_plus/flutter_markdown_plus.dart';
 import 'services/backend_api.dart';
 import 'utils/close_app.dart';
 
@@ -29,14 +30,16 @@ class CysticCareApp extends StatelessWidget {
 }
 
 class ChatMessage {
-  final String content;
+  String content;
   final bool isUser;
   final DateTime timestamp;
+  ValidationInfo? validation;
 
   ChatMessage({
     required this.content,
     required this.isUser,
     required this.timestamp,
+    this.validation,
   });
 }
 
@@ -54,9 +57,13 @@ class _ChatScreenState extends State<ChatScreen> {
   final BackendApi _api = BackendApi();
   bool _isSessionInitialized = false;
   bool _isLoading = false;
+  bool _isRequestActive = false;
+  int _requestEpoch = 0;
+  String? _currentStatus;
   String? _sessionId;
   String? _error;
   bool _disclaimerAccepted = false;
+  List<String> _followupQuestions = [];
 
   static const List<String> quickQuestions = [
     "What is Polycystic Kidney Disease?",
@@ -147,13 +154,18 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
-  void _addMessage(String content, {required bool isUser}) {
+  void _addMessage(
+    String content, {
+    required bool isUser,
+    ValidationInfo? validation,
+  }) {
     setState(() {
       _messages.add(
         ChatMessage(
           content: content,
           isUser: isUser,
           timestamp: DateTime.now(),
+          validation: validation,
         ),
       );
     });
@@ -174,6 +186,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
   Future<void> _sendMessage(String text) async {
     if (text.trim().isEmpty) return;
+    if (_isRequestActive) return;
     if (!_isSessionInitialized || _sessionId == null) {
       setState(() => _error = 'Session is not initialized yet.');
       return;
@@ -184,35 +197,152 @@ class _ChatScreenState extends State<ChatScreen> {
 
     setState(() {
       _isLoading = true;
+      _isRequestActive = true;
+      _currentStatus = "Connecting...";
       _error = null;
+      _followupQuestions = [];
     });
 
-    try {
-      final reply = await _api.chat(sessionId: _sessionId!, message: text);
-      setState(() {
-        _isLoading = false;
-      });
+    ChatMessage? activeBotMessage;
+    List<String> sourceTitles = [];
+    List<String> sourceCitations = [];
 
-      String response = reply.response;
-      // Optionally append sources if available
-      if (reply.sourceTitles.isNotEmpty) {
-        final srcTitles = reply.sourceTitles.take(3).join(', ');
-        response = '$response\n\nSources: $srcTitles';
+    final requestEpoch = ++_requestEpoch;
+    try {
+      final stream = _api.chatStream(sessionId: _sessionId!, message: text);
+
+      await for (final event in stream) {
+        if (requestEpoch != _requestEpoch) break;
+        switch (event.type) {
+          case ChatStreamEventType.status:
+            setState(() {
+              _currentStatus = event.status;
+              // Keep typing indicator visible for post-generation processes
+              if (activeBotMessage != null) {
+                _isLoading = true;
+              }
+            });
+            _scrollToBottom();
+            break;
+
+          case ChatStreamEventType.sources:
+            if (event.sourceTitles != null) {
+              sourceTitles = event.sourceTitles!;
+            }
+            if (event.sourceCitations != null) {
+              sourceCitations = event.sourceCitations!;
+            }
+            break;
+
+          case ChatStreamEventType.chunk:
+            if (event.chunk == null) break;
+            if (activeBotMessage == null) {
+              activeBotMessage = ChatMessage(
+                content: event.chunk!,
+                isUser: false,
+                timestamp: DateTime.now(),
+              );
+              setState(() {
+                _isLoading =
+                    false; // Hide typing indicator and let bubble render
+                _messages.add(activeBotMessage!);
+              });
+            } else {
+              setState(() {
+                activeBotMessage!.content += event.chunk!;
+              });
+            }
+            _scrollToBottom();
+            break;
+
+          case ChatStreamEventType.followup:
+            setState(() {
+              if (event.followupQuestions != null) {
+                _followupQuestions = event.followupQuestions!;
+              }
+            });
+            break;
+
+          case ChatStreamEventType.validation:
+            if (event.validation == null) break;
+            setState(() {
+              if (activeBotMessage != null) {
+                if (event.validationText != null) {
+                  // Handle corrective regeneration: smooth swap/animation
+                  activeBotMessage.content = event.validationText!;
+                }
+                activeBotMessage.validation = event.validation;
+              }
+            });
+            _scrollToBottom();
+            break;
+
+          case ChatStreamEventType.error:
+            if (event.error != null) {
+              setState(() {
+                _error = 'Stream Error: ${event.error}';
+              });
+            }
+            break;
+
+          case ChatStreamEventType.done:
+            break;
+        }
       }
-      _addMessage(response, isUser: false);
-    } catch (e) {
+
+      if (requestEpoch != _requestEpoch) return;
+
+      // After stream successfully completes, append any buffered sources
+      if (activeBotMessage != null && sourceCitations.isNotEmpty) {
+        String sourcesBlock = '\n\n━━━━━━━━━━━━━━━━\n📚 Sources:\n\n';
+        for (int i = 0; i < sourceCitations.length; i++) {
+          final authorYear = sourceCitations[i];
+          final title = i < sourceTitles.length ? sourceTitles[i] : '';
+
+          sourcesBlock += '[${i + 1}] $authorYear';
+          if (title.isNotEmpty && title != 'Unknown') {
+            sourcesBlock += ':\n    "$title"';
+          }
+          sourcesBlock += '\n\n';
+        }
+        setState(() {
+          activeBotMessage!.content += sourcesBlock;
+        });
+        _scrollToBottom();
+      }
+
       setState(() {
         _isLoading = false;
-        _error = 'Failed to send message: $e';
+        _currentStatus = null;
       });
+    } catch (e) {
+      if (mounted && requestEpoch == _requestEpoch) {
+        setState(() {
+          _isLoading = false;
+          _currentStatus = null;
+          _error = 'Failed to stream response: $e';
+        });
+      }
+    } finally {
+      if (mounted && requestEpoch == _requestEpoch) {
+        setState(() {
+          _isRequestActive = false;
+          _isLoading = false;
+          _currentStatus = null;
+        });
+      }
     }
   }
 
   // Removed mock response generator; responses now come from backend API.
 
   void _clearChat() {
+    _requestEpoch++;
     setState(() {
       _messages.clear();
+      _isLoading = false;
+      _isRequestActive = false;
+      _currentStatus = null;
     });
     _addMessage(
       "Chat history cleared. How can I help you with PKD-related questions?",
@@ -221,10 +351,14 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   void _resetSession() {
+    _requestEpoch++;
     setState(() {
       _messages.clear();
       _isSessionInitialized = false;
       _sessionId = null;
+      _isLoading = false;
+      _isRequestActive = false;
+      _currentStatus = null;
     });
     _initializeSession();
   }
@@ -316,8 +450,7 @@ class _ChatScreenState extends State<ChatScreen> {
                 child: Text('Please accept the disclaimer to continue.'),
               ),
             )
-          else
-          if (!_isSessionInitialized && _isLoading)
+          else if (!_isSessionInitialized && _isLoading)
             const Expanded(
               child: Center(
                 child: Column(
@@ -332,6 +465,8 @@ class _ChatScreenState extends State<ChatScreen> {
             )
           else
             Expanded(child: _buildChatArea()),
+          if (_followupQuestions.isNotEmpty && !_isLoading)
+            _buildFollowUpSuggestions(),
         ],
       ),
     );
@@ -446,21 +581,83 @@ class _ChatScreenState extends State<ChatScreen> {
             const SizedBox(width: 8),
           ],
           Flexible(
-            child: Container(
-              padding: const EdgeInsets.all(16),
-              decoration: BoxDecoration(
-                color: message.isUser
-                    ? const Color(0xFF2E86AB)
-                    : Colors.grey[100],
-                borderRadius: BorderRadius.circular(16),
-              ),
-              child: Text(
-                message.content,
-                style: TextStyle(
-                  color: message.isUser ? Colors.white : Colors.black87,
-                  fontSize: 16,
+            child: Column(
+              crossAxisAlignment: message.isUser
+                  ? CrossAxisAlignment.end
+                  : CrossAxisAlignment.start,
+              children: [
+                Container(
+                  padding: const EdgeInsets.all(16),
+                  decoration: BoxDecoration(
+                    color: message.isUser
+                        ? const Color(0xFF2E86AB)
+                        : Colors.grey[100],
+                    borderRadius: BorderRadius.circular(16),
+                  ),
+                  child: message.isUser
+                      ? Text(
+                          message.content,
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 16,
+                            height: 1.45,
+                          ),
+                        )
+                      : MarkdownBody(
+                          data: message.content,
+                          selectable: true,
+                          styleSheet:
+                              MarkdownStyleSheet.fromTheme(
+                                Theme.of(context),
+                              ).copyWith(
+                                p: const TextStyle(
+                                  color: Colors.black87,
+                                  fontSize: 16,
+                                  height: 1.5,
+                                ),
+                                strong: const TextStyle(
+                                  color: Colors.black87,
+                                  fontSize: 16,
+                                  fontWeight: FontWeight.w700,
+                                  height: 1.5,
+                                ),
+                                em: const TextStyle(
+                                  color: Colors.black87,
+                                  fontSize: 16,
+                                  fontStyle: FontStyle.italic,
+                                  height: 1.5,
+                                ),
+                                h1: const TextStyle(
+                                  color: Colors.black87,
+                                  fontSize: 22,
+                                  fontWeight: FontWeight.w700,
+                                  height: 1.35,
+                                ),
+                                h2: const TextStyle(
+                                  color: Colors.black87,
+                                  fontSize: 20,
+                                  fontWeight: FontWeight.w700,
+                                  height: 1.35,
+                                ),
+                                h3: const TextStyle(
+                                  color: Colors.black87,
+                                  fontSize: 18,
+                                  fontWeight: FontWeight.w700,
+                                  height: 1.4,
+                                ),
+                                listBullet: const TextStyle(
+                                  color: Colors.black87,
+                                  fontSize: 16,
+                                  height: 1.5,
+                                ),
+                                blockSpacing: 12,
+                                listIndent: 22,
+                              ),
+                        ),
                 ),
-              ),
+                if (!message.isUser && message.validation != null)
+                  _buildValidationBadge(message.validation!),
+              ],
             ),
           ),
           if (message.isUser) ...[
@@ -473,6 +670,189 @@ class _ChatScreenState extends State<ChatScreen> {
         ],
       ),
     );
+  }
+
+  Widget _buildValidationBadge(ValidationInfo validation) {
+    final score = (validation.overallScore * 100).round();
+    final Color badgeColor;
+    final IconData badgeIcon;
+    final String label;
+
+    if (validation.passed) {
+      badgeColor = const Color(0xFF4CAF50); // green
+      badgeIcon = Icons.verified;
+      label = 'Validated $score%';
+    } else if (validation.overallScore >= 0.5) {
+      badgeColor = const Color(0xFFFFA726); // orange
+      badgeIcon = Icons.warning_amber_rounded;
+      label = 'Caution $score%';
+    } else {
+      badgeColor = const Color(0xFFEF5350); // red
+      badgeIcon = Icons.error_outline;
+      label = 'Low confidence $score%';
+    }
+
+    return Padding(
+      padding: const EdgeInsets.only(top: 6),
+      child: GestureDetector(
+        onTap: () => _showValidationDetails(validation),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+          decoration: BoxDecoration(
+            color: badgeColor.withValues(alpha: 0.12),
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: badgeColor.withValues(alpha: 0.3)),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(badgeIcon, size: 14, color: badgeColor),
+              const SizedBox(width: 4),
+              Text(
+                label,
+                style: TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600,
+                  color: badgeColor,
+                ),
+              ),
+              if (validation.wasRegenerated) ...[
+                const SizedBox(width: 4),
+                Icon(Icons.autorenew, size: 12, color: badgeColor),
+              ],
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  void _showValidationDetails(ValidationInfo validation) {
+    showModalBottomSheet(
+      context: context,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (ctx) {
+        return Padding(
+          padding: const EdgeInsets.all(20),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Icon(
+                    validation.passed
+                        ? Icons.verified
+                        : Icons.warning_amber_rounded,
+                    color: validation.passed
+                        ? const Color(0xFF4CAF50)
+                        : const Color(0xFFFFA726),
+                    size: 24,
+                  ),
+                  const SizedBox(width: 8),
+                  Text(
+                    'Answer Validation — ${(validation.overallScore * 100).round()}%',
+                    style: const TextStyle(
+                      fontSize: 18,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ],
+              ),
+              if (validation.wasRegenerated)
+                const Padding(
+                  padding: EdgeInsets.only(top: 8),
+                  child: Text(
+                    'This answer was automatically improved by the validation agent.',
+                    style: TextStyle(
+                      fontSize: 13,
+                      fontStyle: FontStyle.italic,
+                      color: Colors.black54,
+                    ),
+                  ),
+                ),
+              const SizedBox(height: 16),
+              ...validation.checks.entries.map((entry) {
+                final name = entry.key;
+                final check = entry.value;
+                final pct = (check.score * 100).round();
+                return Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 4),
+                  child: Row(
+                    children: [
+                      Icon(
+                        check.passed ? Icons.check_circle : Icons.cancel,
+                        size: 18,
+                        color: check.passed
+                            ? const Color(0xFF4CAF50)
+                            : const Color(0xFFEF5350),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          _formatCheckName(name),
+                          style: const TextStyle(fontSize: 14),
+                        ),
+                      ),
+                      Text(
+                        '$pct%',
+                        style: TextStyle(
+                          fontSize: 14,
+                          fontWeight: FontWeight.w600,
+                          color: check.passed
+                              ? const Color(0xFF4CAF50)
+                              : const Color(0xFFEF5350),
+                        ),
+                      ),
+                    ],
+                  ),
+                );
+              }),
+              if (validation.warnings.isNotEmpty) ...[
+                const SizedBox(height: 12),
+                const Text(
+                  'Warnings:',
+                  style: TextStyle(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600,
+                    color: Colors.black54,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                ...validation.warnings.map(
+                  (w) => Padding(
+                    padding: const EdgeInsets.only(left: 8, top: 2),
+                    child: Text(
+                      '• $w',
+                      style: const TextStyle(
+                        fontSize: 12,
+                        color: Colors.black54,
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+              const SizedBox(height: 16),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  String _formatCheckName(String key) {
+    switch (key) {
+      case 'relevance':
+        return 'Relevance';
+      case 'source_attribution':
+        return 'Source Attribution';
+      case 'safety':
+        return 'Safety & Disclaimers';
+      default:
+        return key;
+    }
   }
 
   Widget _buildTypingIndicator() {
@@ -511,13 +891,51 @@ class _ChatScreenState extends State<ChatScreen> {
               color: Colors.grey[100],
               borderRadius: BorderRadius.circular(16),
             ),
-            child: const Text(
-              'CysticCare AI is thinking...',
-              style: TextStyle(
+            child: Text(
+              _currentStatus ?? 'CysticCare AI is thinking...',
+              style: const TextStyle(
                 color: Colors.black54,
                 fontStyle: FontStyle.italic,
               ),
             ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildFollowUpSuggestions() {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+      decoration: BoxDecoration(
+        color: Colors.grey[50],
+        border: Border(top: BorderSide(color: Colors.grey[200]!)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text(
+            'Suggested follow-up questions:',
+            style: TextStyle(
+              fontSize: 13,
+              fontWeight: FontWeight.w600,
+              color: Color(0xFF2E86AB),
+            ),
+          ),
+          const SizedBox(height: 8),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: _followupQuestions.map((question) {
+              return ActionChip(
+                label: Text(question, style: const TextStyle(fontSize: 13)),
+                backgroundColor: Colors.white,
+                side: const BorderSide(color: Color(0xFF2E86AB)),
+                labelStyle: const TextStyle(color: Color(0xFF2E86AB)),
+                onPressed: () => _sendMessage(question),
+              );
+            }).toList(),
           ),
         ],
       ),
@@ -561,12 +979,14 @@ class _ChatScreenState extends State<ChatScreen> {
               ),
               maxLines: null,
               textInputAction: TextInputAction.send,
-              onSubmitted: _sendMessage,
+              onSubmitted: _isRequestActive ? null : _sendMessage,
             ),
           ),
           const SizedBox(width: 8),
           FloatingActionButton(
-            onPressed: () => _sendMessage(_textController.text),
+            onPressed: _isRequestActive
+                ? null
+                : () => _sendMessage(_textController.text),
             backgroundColor: const Color(0xFF2E86AB),
             child: const Icon(Icons.send, color: Colors.white),
           ),
@@ -677,6 +1097,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
   @override
   void dispose() {
+    _requestEpoch++;
     _textController.dispose();
     _scrollController.dispose();
     super.dispose();

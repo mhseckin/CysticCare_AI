@@ -42,6 +42,34 @@ class MetadataManager:
                 logger.error(f"Error loading metadata cache: {e}")
         return {}
     
+    def _load_metadata_from_json(self, file_name: str) -> Optional[Dict[str, Any]]:
+        """
+        Load metadata for a specific file from papers_metadata.json
+        
+        Args:
+            file_name: Name of the PDF file
+            
+        Returns:
+            Metadata dictionary from JSON or None if not found
+        """
+        try:
+            # Try to load from papers_metadata.json in the same directory as this file
+            json_file = os.path.join(
+                os.path.dirname(os.path.dirname(__file__)), 
+                "papers_metadata.json"
+            )
+            
+            if os.path.exists(json_file):
+                with open(json_file, 'r') as f:
+                    metadata_map = json.load(f)
+                
+                if file_name in metadata_map:
+                    return metadata_map[file_name]
+        except Exception as e:
+            logger.debug(f"Could not load metadata from JSON for {file_name}: {e}")
+        
+        return None
+    
     def _save_cache(self):
         """Save metadata cache to disk"""
         try:
@@ -65,42 +93,70 @@ class MetadataManager:
         """
         file_name = os.path.basename(pdf_path)
         
-        # Try to extract author and year from filename (common pattern: Author_Year.pdf)
-        filename_parts = self._parse_filename(file_name)
+        # First, try to load from papers_metadata.json if available
+        json_metadata = self._load_metadata_from_json(file_name)
         
-        # Get basic metadata
-        title = pdf_metadata.get("title", "Unknown")
-        author = pdf_metadata.get("author", "Unknown")
-        
-        # If metadata is missing or generic, try to infer from filename
-        if title == "Unknown" or title == "" or "untitled" in title.lower():
-            title = filename_parts.get("title", file_name.replace(".pdf", ""))
-        
-        if author == "Unknown" or author == "":
-            author = filename_parts.get("author", "Unknown Author")
-        
-        # Create enhanced metadata
-        enhanced_metadata = {
-            "file_name": file_name,
-            "file_path": pdf_path,
-            "title": self._clean_metadata_string(title),
-            "author": self._clean_metadata_string(author),
-            "year": filename_parts.get("year", "Unknown"),
-            "subject": pdf_metadata.get("subject", "Polycystic Kidney Disease"),
-            "creation_date": pdf_metadata.get("creation_date", "Unknown"),
-            "source_type": "scientific_paper",
-            "indexed_date": datetime.now().isoformat(),
-            # Additional fields for better attribution
-            "citation": self._create_citation(
-                author=self._clean_metadata_string(author),
-                year=filename_parts.get("year", "Unknown"),
-                title=self._clean_metadata_string(title)
-            ),
-            "display_name": self._create_display_name(
-                author=self._clean_metadata_string(author),
-                year=filename_parts.get("year", "Unknown")
-            )
-        }
+        if json_metadata:
+            # Use metadata from JSON file
+            enhanced_metadata = {
+                "file_name": file_name,
+                "file_path": pdf_path,
+                "title": self._clean_metadata_string(json_metadata.get("title", "Unknown")),
+                "author": self._clean_metadata_string(json_metadata.get("author", "Unknown")),
+                "year": json_metadata.get("year", "Unknown"),
+                "journal": json_metadata.get("journal", "Unknown"),
+                "subject": pdf_metadata.get("subject", "Polycystic Kidney Disease"),
+                "creation_date": pdf_metadata.get("creation_date", "Unknown"),
+                "source_type": "scientific_paper",
+                "indexed_date": datetime.now().isoformat(),
+                # Additional fields for better attribution
+                "citation": self._create_citation(
+                    author=self._clean_metadata_string(json_metadata.get("author", "Unknown")),
+                    year=json_metadata.get("year", "Unknown"),
+                    title=self._clean_metadata_string(json_metadata.get("title", "Unknown"))
+                ),
+                "display_name": self._create_display_name(
+                    author=self._clean_metadata_string(json_metadata.get("author", "Unknown")),
+                    year=json_metadata.get("year", "Unknown")
+                )
+            }
+        else:
+            # Fall back to filename parsing
+            filename_parts = self._parse_filename(file_name)
+            
+            # Get basic metadata
+            title = pdf_metadata.get("title", "Unknown")
+            author = pdf_metadata.get("author", "Unknown")
+            
+            # If metadata is missing or generic, try to infer from filename
+            if title == "Unknown" or title == "" or "untitled" in title.lower():
+                title = filename_parts.get("title", file_name.replace(".pdf", ""))
+            
+            if author == "Unknown" or author == "":
+                author = filename_parts.get("author", "Unknown Author")
+            
+            # Create enhanced metadata
+            enhanced_metadata = {
+                "file_name": file_name,
+                "file_path": pdf_path,
+                "title": self._clean_metadata_string(title),
+                "author": self._clean_metadata_string(author),
+                "year": filename_parts.get("year", "Unknown"),
+                "subject": pdf_metadata.get("subject", "Polycystic Kidney Disease"),
+                "creation_date": pdf_metadata.get("creation_date", "Unknown"),
+                "source_type": "scientific_paper",
+                "indexed_date": datetime.now().isoformat(),
+                # Additional fields for better attribution
+                "citation": self._create_citation(
+                    author=self._clean_metadata_string(author),
+                    year=filename_parts.get("year", "Unknown"),
+                    title=self._clean_metadata_string(title)
+                ),
+                "display_name": self._create_display_name(
+                    author=self._clean_metadata_string(author),
+                    year=filename_parts.get("year", "Unknown")
+                )
+            }
         
         # Cache the metadata
         self.metadata_cache[file_name] = enhanced_metadata
@@ -178,7 +234,7 @@ class MetadataManager:
             title: Paper title
             
         Returns:
-            Formatted citation string
+            Formatted citation string (shortened for readability)
         """
         if author == "Unknown" or author == "":
             author = "Unknown Author"
@@ -187,7 +243,28 @@ class MetadataManager:
         if title == "Unknown" or title == "":
             title = "Untitled"
         
-        return f"{author} ({year}). {title}"
+        # Shorten very long titles for better readability
+        short_title = self._shorten_title(title, max_length=80)
+        
+        return f"{author} ({year}). {short_title}"
+    
+    def _shorten_title(self, title: str, max_length: int = 80) -> str:
+        """
+        Shorten a title to a maximum length while preserving meaning
+        
+        Args:
+            title: Full title string
+            max_length: Maximum character length
+            
+        Returns:
+            Shortened title
+        """
+        if len(title) <= max_length:
+            return title
+        
+        # Find last complete word before max_length
+        shortened = title[:max_length].rsplit(' ', 1)[0]
+        return shortened + "..."
     
     def _create_display_name(self, author: str, year: str) -> str:
         """

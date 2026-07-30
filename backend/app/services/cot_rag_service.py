@@ -4,13 +4,40 @@ Implements multi-step reasoning for complex medical queries
 """
 
 import logging
-from typing import Dict, Any, List, Optional
-from services.openai_service import OpenAIService
-from services.openai_rag_init import search_knowledge_base
+from typing import Dict, Any, List
+from .openai_service import OpenAIService
+from . import openai_rag_init
+from .openai_rag_init import (
+    EMPTY_KNOWLEDGE_BASE_MESSAGE,
+    INSUFFICIENT_RETRIEVAL_MESSAGE,
+)
+from ..utils.refusal_utils import REFUSAL_MESSAGE, get_guardrail_response, is_refusal_response
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+OFF_TOPIC_SENTINEL = "OFF_TOPIC"
+OFF_TOPIC_MESSAGE = REFUSAL_MESSAGE
+
+
+COT_RAG_SYSTEM_PROMPT = f"""You are a helpful medical AI assistant specialized in Polycystic Kidney Disease (PKD), ADPKD, and kidney-related disease topics.
+
+If the question is asking anything other than PKD, ADPKD, or any kidney related disease, respond EXACTLY with:
+"{REFUSAL_MESSAGE}"
+
+If the reasoning or retrieved context is not sufficient to answer the question, respond EXACTLY with:
+"{REFUSAL_MESSAGE}"
+
+You've reasoned through a complex question step-by-step. Now synthesize your findings into a comprehensive, well-structured answer.
+
+Structure your response:
+1. Start with a direct answer to the main question
+2. Provide detailed explanation with evidence from your reasoning
+3. Include relevant clinical implications or recommendations if applicable
+4. End with any important caveats or notes
+
+Write clearly and professionally, as if explaining to a patient or medical student."""
 
 
 class ChainOfThoughtRAG:
@@ -41,9 +68,15 @@ class ChainOfThoughtRAG:
         Returns:
             List of sub-questions to answer sequentially
         """
-        system_prompt = """You are an expert at breaking down complex medical questions into logical steps.
+        system_prompt = """You are an expert at breaking down complex kidney-disease questions into logical steps.
 
-Given a user's question about Polycystic Kidney Disease (PKD), identify the key sub-questions that need to be answered to fully address their query.
+If the question is asking anything other than PKD, ADPKD, or any kidney related disease, output EXACTLY:
+OFF_TOPIC
+
+        Given a user's question about Polycystic Kidney Disease (PKD), ADPKD, or another kidney-related disease, identify the key sub-questions that need to be answered to fully address their query.
+
+If the user's question is NOT related to PKD, kidney disease, renal health, nephrology, or kidney-related medical care, output EXACTLY:
+OFF_TOPIC
 
 Output ONLY a numbered list of sub-questions, one per line. Keep it concise (2-5 sub-questions maximum).
 
@@ -62,30 +95,32 @@ Output:
                 system_prompt=system_prompt,
                 user_message=user_message,
                 temperature=0.3,  # Lower temperature for more focused decomposition
-                max_tokens=500
+                max_tokens=2000  # reasoning model floor: tiny budgets return empty content
             )
+
+            if response.strip().strip('"\'').upper() == OFF_TOPIC_SENTINEL:
+                logger.info("Query decomposition blocked as off-topic")
+                return [OFF_TOPIC_SENTINEL]
             
-            # Parse numbered list
             sub_questions = []
             for line in response.strip().split('\n'):
                 line = line.strip()
                 if line and (line[0].isdigit() or line.startswith('-') or line.startswith('•')):
-                    # Remove numbering/bullets
                     cleaned = line.lstrip('0123456789.-•) ').strip()
                     if cleaned:
                         sub_questions.append(cleaned)
             
             logger.info(f"Decomposed query into {len(sub_questions)} sub-questions")
-            return sub_questions if sub_questions else [query]  # Fallback to original
+            return sub_questions if sub_questions else [query]
             
         except Exception as e:
             logger.error(f"Error decomposing query: {e}")
-            return [query]  # Fallback to original query
+            return [query]
     
     async def retrieve_for_step(
         self,
         sub_question: str,
-        top_k: int = 3
+        top_k: int = 5
     ) -> Dict[str, Any]:
         """
         Retrieve relevant documents for a specific sub-question
@@ -98,7 +133,7 @@ Output:
             Dictionary with retrieved documents and metadata
         """
         try:
-            search_results = await search_knowledge_base(sub_question, top_k)
+            search_results = await openai_rag_init.search_knowledge_base(sub_question, top_k)
             return search_results
         except Exception as e:
             logger.error(f"Error retrieving for sub-question: {e}")
@@ -132,7 +167,10 @@ Output:
                 for i, finding in enumerate(previous_findings)
             )
         
-        system_prompt = f"""You are a medical AI assistant reasoning through a complex question step-by-step.
+        system_prompt = f"""You are a medical AI assistant reasoning through a complex kidney-disease question step-by-step.
+
+If the question is asking anything other than PKD, ADPKD, or any kidney related disease, respond EXACTLY with:
+"{REFUSAL_MESSAGE}"
 
 Your task: Answer the current sub-question using the provided medical literature context. Be specific and cite what you find in the sources.
 
@@ -154,7 +192,7 @@ Your reasoning:"""
                 system_prompt=system_prompt,
                 user_message=user_message,
                 temperature=0.5,
-                max_tokens=400
+                max_tokens=2000  # reasoning model floor: tiny budgets return empty content
             )
             
             return response.strip()
@@ -191,17 +229,7 @@ Your reasoning:"""
         
         reasoning_summary = "\n\n".join(chain_of_thought)
         
-        system_prompt = """You are a helpful medical AI assistant specialized in Polycystic Kidney Disease (PKD).
-
-You've reasoned through a complex question step-by-step. Now synthesize your findings into a comprehensive, well-structured answer.
-
-Structure your response:
-1. Start with a direct answer to the main question
-2. Provide detailed explanation with evidence from your reasoning
-3. Include relevant clinical implications or recommendations if applicable
-4. End with any important caveats or notes
-
-Write clearly and professionally, as if explaining to a patient or medical student."""
+        system_prompt = COT_RAG_SYSTEM_PROMPT
         
         user_message = f"""ORIGINAL QUESTION: {original_query}
 
@@ -227,7 +255,7 @@ Based on this step-by-step analysis, provide a comprehensive answer:"""
     async def get_cot_rag_response(
         self,
         query: str,
-        top_k_per_step: int = 3,
+        top_k_per_step: int = 5,
         temperature: float = 0.7,
         max_tokens: int = 2000,
         max_steps: int = 5
@@ -247,35 +275,67 @@ Based on this step-by-step analysis, provide a comprehensive answer:"""
         """
         try:
             logger.info(f"Starting CoT RAG for query: {query[:100]}...")
+
+            guardrail_response = get_guardrail_response(query)
+            if guardrail_response is not None:
+                logger.info("CoT RAG answered query via guardrail before decomposition")
+                return {
+                    "status": "success",
+                    "response": guardrail_response,
+                    "sources": [],
+                    "query": query,
+                    "reasoning_chain": [],
+                    "cot_enabled": False,
+                    "retrieved_chunks": [],
+                    "off_topic": guardrail_response == OFF_TOPIC_MESSAGE,
+                    "refused": guardrail_response == OFF_TOPIC_MESSAGE,
+                }
             
-            # Step 1: Decompose query into sub-questions
             sub_questions = await self.decompose_query(query)
-            sub_questions = sub_questions[:max_steps]  # Limit steps
+            if sub_questions == [OFF_TOPIC_SENTINEL]:
+                return {
+                    "status": "success",
+                    "response": OFF_TOPIC_MESSAGE,
+                    "sources": [],
+                    "query": query,
+                    "reasoning_chain": [],
+                    "cot_enabled": False,
+                    "retrieved_chunks": [],
+                    "off_topic": True,
+                    "refused": True,
+                }
+            sub_questions = sub_questions[:max_steps]
             logger.info(f"Query decomposed into {len(sub_questions)} steps")
             
-            # Step 2: Process each sub-question
             reasoning_steps = []
             all_sources = []
+            all_sources_raw = []
             previous_findings = []
+            retrieval_steps = []
             
             for i, sub_question in enumerate(sub_questions):
                 logger.info(f"Processing step {i+1}: {sub_question[:80]}...")
                 
-                # Retrieve relevant documents
                 search_results = await self.retrieve_for_step(sub_question, top_k_per_step)
+                retrieval_metadata = search_results.get("retrieval_metadata", {})
+                retrieval_steps.append({
+                    "step": i + 1,
+                    "result_count": len(search_results.get("results", [])),
+                    "confidence": retrieval_metadata.get("confidence"),
+                    "reranker_used": retrieval_metadata.get("reranker_used"),
+                    "candidate_count": retrieval_metadata.get("candidate_count"),
+                })
                 
                 if search_results["status"] != "success" or not search_results["results"]:
                     logger.warning(f"No results for step {i+1}")
                     continue
                 
-                # Format context
                 context_parts = []
                 for j, result in enumerate(search_results["results"]):
                     meta = result.get("metadata", {})
                     display_name = meta.get("display_name", f"Source {len(all_sources)+j+1}")
                     context_parts.append(f"[{display_name}]\n{result['document']}")
                     
-                    # Track all sources
                     source_info = {
                         "index": len(all_sources) + j + 1,
                         "title": meta.get("title", "Unknown"),
@@ -288,10 +348,9 @@ Based on this step-by-step analysis, provide a comprehensive answer:"""
                         "step": i + 1
                     }
                     all_sources.append(source_info)
+                    all_sources_raw.append(result)
                 
                 context = "\n\n".join(context_parts)
-                
-                # Reason through this step
                 reasoning = await self.reason_through_step(
                     sub_question,
                     context,
@@ -308,16 +367,31 @@ Based on this step-by-step analysis, provide a comprehensive answer:"""
                 previous_findings.append(reasoning)
             
             if not reasoning_steps:
-                logger.error("No reasoning steps completed")
+                logger.warning("CoT RAG found no retrieved documents across reasoning steps")
+                retrieval_confidence = (
+                    "insufficient"
+                    if any(step.get("confidence") == "insufficient" for step in retrieval_steps)
+                    else "unavailable"
+                )
                 return {
-                    "status": "error",
-                    "message": "Unable to complete reasoning process",
-                    "response": None,
+                    "status": "success",
+                    "response": (
+                        INSUFFICIENT_RETRIEVAL_MESSAGE
+                        if retrieval_confidence == "insufficient"
+                        else EMPTY_KNOWLEDGE_BASE_MESSAGE
+                    ),
+                    "query": query,
                     "reasoning_chain": [],
-                    "sources": []
+                    "sources": [],
+                    "cot_enabled": False,
+                    "retrieved_chunks": [],
+                    "refused": True,
+                    "retrieval_metadata": {
+                        "confidence": retrieval_confidence,
+                        "steps": retrieval_steps,
+                    },
                 }
             
-            # Step 3: Synthesize final answer
             logger.info("Synthesizing final answer...")
             final_answer = await self.synthesize_final_answer(
                 query,
@@ -325,15 +399,38 @@ Based on this step-by-step analysis, provide a comprehensive answer:"""
                 temperature,
                 max_tokens
             )
+
+            if is_refusal_response(final_answer):
+                logger.info("CoT synthesis returned refusal response")
+                return {
+                    "status": "success",
+                    "response": OFF_TOPIC_MESSAGE,
+                    "sources": [],
+                    "query": query,
+                    "reasoning_chain": [],
+                    "cot_enabled": False,
+                    "retrieved_chunks": [],
+                    "retrieval_debug_chunks": all_sources_raw,
+                    "off_topic": True,
+                    "refused": True,
+                    "retrieval_metadata": {
+                        "confidence": "context_available",
+                        "steps": retrieval_steps,
+                    },
+                }
             
-            # Deduplicate sources by file name
             unique_sources = {}
             for source in all_sources:
-                key = source["file"]
-                if key not in unique_sources or source["relevance_score"] > unique_sources[key]["relevance_score"]:
-                    unique_sources[key] = source
+                key = source["display_name"] or source["file"] or source["citation"] or str(source["index"])
+                if key not in unique_sources:
+                    unique_sources[key] = source.copy()
+                    unique_sources[key]["steps_used"] = [source["step"]]
+                else:
+                    if source["relevance_score"] > unique_sources[key]["relevance_score"]:
+                        unique_sources[key]["relevance_score"] = source["relevance_score"]
+                    if source["step"] not in unique_sources[key]["steps_used"]:
+                        unique_sources[key]["steps_used"].append(source["step"])
             
-            # Re-index sources
             final_sources = []
             for i, source in enumerate(sorted(unique_sources.values(), key=lambda x: -x["relevance_score"]), 1):
                 source["index"] = i
@@ -347,7 +444,13 @@ Based on this step-by-step analysis, provide a comprehensive answer:"""
                 "reasoning_chain": reasoning_steps,
                 "sources": final_sources,
                 "query": query,
-                "cot_enabled": True
+                "cot_enabled": True,
+                "retrieved_chunks": all_sources_raw,
+                "refused": False,
+                "retrieval_metadata": {
+                    "confidence": "context_available",
+                    "steps": retrieval_steps,
+                },
             }
             
         except Exception as e:
